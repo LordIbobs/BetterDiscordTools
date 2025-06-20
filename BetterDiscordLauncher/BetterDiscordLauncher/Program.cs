@@ -9,26 +9,22 @@ using System.Threading.Tasks;
 
 namespace BetterDiscordLauncher
 {
-    class Program
+    internal class Program
     {
         static readonly string launcherBasePath = AppDomain.CurrentDomain.BaseDirectory;
-        static readonly string bdInstallPathAppData = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-            "BetterDiscord");
+        static readonly string bdInstallPathAppData = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "BetterDiscord");
         static readonly string bdDataPath = Path.Combine(bdInstallPathAppData, "data");
         static readonly string asarFileName = "betterdiscord.asar";
         static readonly string asarFilePath = Path.Combine(bdDataPath, asarFileName);
         static readonly string versionFileLocal = Path.Combine(launcherBasePath, "discord_version.cache");
         static readonly string logFilePath = Path.Combine(launcherBasePath, "launcher.log");
-        static readonly string discordBasePath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "Discord");
+        static readonly string discordBasePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Discord");
 
         [DllImport("kernel32.dll")]
         private static extern IntPtr GetConsoleWindow();
         [DllImport("user32.dll")]
         private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-        private const int SW_HIDE = 0;
+        const int SW_HIDE = 0;
 
         static bool showConsole = false;
 
@@ -40,51 +36,168 @@ namespace BetterDiscordLauncher
 
             LogStep("=== BetterDiscord Launcher started ===");
             Directory.CreateDirectory(launcherBasePath);
+
             if (!File.Exists(versionFileLocal))
                 await File.WriteAllTextAsync(versionFileLocal, "");
 
-            var discordExePath = GetLatestDiscordExePath();
-            if (discordExePath == null)
-            {
-                LogError("Discord не найден. Выход.");
-                if (showConsole) WaitForExit();
-                return;
-            }
-            LogSuccess($"Discord найден: {discordExePath}");
-
-            var currentVersion = GetDiscordVersion(discordExePath);
-            LogStep($"Текущая версия Discord: {currentVersion}");
-
-            var savedVersion = (await File.ReadAllTextAsync(versionFileLocal)).Trim();
-            LogStep($"Сохранённая версия Discord: {savedVersion}");
-
             if (!Directory.Exists(bdInstallPathAppData))
             {
-                LogError("Папка BetterDiscord не найдена. Начинаем установку...");
-                await DownloadAndLaunchInstaller(discordExePath);
-                if (showConsole) WaitForExit();
+                LogStep("[*] Папка BetterDiscord не найдена. Загружаем установщик...");
+                const string installerUrl = "https://github.com/BetterDiscord/Installer/releases/latest/download/BetterDiscord-Windows.exe";
+                string installerPath = Path.Combine(launcherBasePath, "BetterDiscord-Installer.exe");
+
+                try
+                {
+                    using var httpClient = new HttpClient();
+                    var installerData = await httpClient.GetByteArrayAsync(installerUrl);
+                    await File.WriteAllBytesAsync(installerPath, installerData);
+
+                    LogSuccess("[+] Установщик BetterDiscord скачан. Запускаем...");
+                    var process = Process.Start(new ProcessStartInfo(installerPath) { UseShellExecute = true });
+                    process?.WaitForExit();
+
+                    LogStep("[*] Установка завершена, удаляем установщик...");
+                    File.Delete(installerPath);
+
+                    LogStep("[*] Запускаем Discord после установки BD...");
+                    string? discordAfterInstall = GetLatestDiscordExePath();
+                    if (discordAfterInstall != null) LaunchDiscord(discordAfterInstall);
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    LogError("[-] Ошибка загрузки или запуска установщика: " + ex.Message);
+                    return;
+                }
+            }
+
+            string? discordExePath = GetLatestDiscordExePath();
+            if (discordExePath == null)
+            {
+                LogError("Discord не найден.");
                 return;
             }
 
-            if (!File.Exists(asarFilePath) || savedVersion != currentVersion)
-            {
-                LogStep("Обновляем betterdiscord.asar...");
-                if (!await UpdateBetterDiscordAsar())
-                {
-                    LogError("Не удалось обновить betterdiscord.asar.");
-                    if (showConsole) WaitForExit();
-                    return;
-                }
-                LogSuccess("Файл betterdiscord.asar обновлён.");
-                await File.WriteAllTextAsync(versionFileLocal, currentVersion);
-            }
-            else LogSuccess("BetterDiscord уже актуален.");
+            LogSuccess($"Discord найден: {discordExePath}");
+
+            string currentVersion = GetDiscordVersion(discordExePath);
+            string savedVersion = (await File.ReadAllTextAsync(versionFileLocal)).Trim();
 
             LogStep("Запускаем Discord...");
             LaunchDiscord(discordExePath);
-            LogSuccess("Discord запущен.");
 
-            if (showConsole) WaitForExit();
+            LogStep("Ожидаем запуска Discord...");
+            await Task.Delay(10000);
+
+            LogStep("Ожидаем закрытия Discord...");
+            KillDiscord();
+
+            LogStep("Discord закрыт, начинаем проверку патча и repair.");
+
+            LogStep("[Check] Проверка наличия патча в index.js...");
+            bool indexJsPatched = IsIndexJsPatched();
+            if (currentVersion != savedVersion || !indexJsPatched)
+            {
+                LogStep("[Check] Патч BetterDiscord не обнаружен или версия обновлена, запускаем repair...");
+                await RepairAsync(discordExePath);
+                await File.WriteAllTextAsync(versionFileLocal, currentVersion);
+            }
+            else
+            {
+                LogStep("[Check] Патч BetterDiscord уже актуален, повторный repair не требуется.");
+            }
+
+            LogStep("Запускаем Discord с исправлениями...");
+            LaunchDiscord(discordExePath);
+            await Task.Delay(5000);
+
+            if (!Process.GetProcessesByName("Discord").Any())
+            {
+                LogError("Discord не запустился. Возможна ошибка патча. Пытаемся восстановить index.js из .bak...");
+                RestoreIndexJsBackup();
+                LaunchDiscord(discordExePath);
+            }
+        }
+
+        static async Task RepairAsync(string discordExePath)
+        {
+            try
+            {
+                if (!File.Exists(asarFilePath))
+                {
+                    LogStep("betterdiscord.asar не найден, скачиваем...");
+                    await UpdateBetterDiscordAsar();
+                }
+
+                var destAsar = Path.Combine(bdDataPath, asarFileName);
+                var tempAsar = destAsar + ".tmp";
+                const int maxTries = 20;
+                bool copied = false;
+
+                for (int i = 0; i < maxTries; i++)
+                {
+                    LogStep($"Процессы Discord перед копированием: {Process.GetProcessesByName("Discord").Length}");
+                    if (!File.Exists(asarFilePath))
+                    {
+                        LogError("Файл betterdiscord.asar исчез до попытки копирования.");
+                        return;
+                    }
+
+                    try
+                    {
+                        await Task.Delay(1000);
+                        File.Copy(asarFilePath, tempAsar, true);
+                        File.Replace(tempAsar, destAsar, null);
+                        LogSuccess("betterdiscord.asar обновлён через File.Replace.");
+                        copied = true;
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        LogStep("Ошибка копирования betterdiscord.asar: " + ex.Message);
+                    }
+                }
+
+                if (!copied)
+                {
+                    LogError("Не удалось обновить betterdiscord.asar — файл всё ещё занят.");
+                    return;
+                }
+
+                var indexJsPath = GetDiscordIndexJsPath();
+                if (indexJsPath == null)
+                {
+                    LogError("index.js не найден для патча.");
+                    return;
+                }
+
+                string appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+                string escapedPath = appData.Replace(@"\", @"\\");
+                string patchContent =
+                    $"require(\"{escapedPath}\\\\BetterDiscord\\\\data\\\\betterdiscord.asar\");\r\n" +
+                    "module.exports = require(\"./core.asar\");";
+
+                if (!File.Exists(indexJsPath))
+                {
+                    LogStep("index.js не найден, создаём с нуля...");
+                    File.WriteAllText(indexJsPath, patchContent);
+                    LogSuccess("index.js создан: " + indexJsPath);
+                }
+
+                string backupPath = Path.Combine(launcherBasePath, "index.js.bak");
+                if (!File.Exists(backupPath))
+                {
+                    File.Copy(indexJsPath, backupPath);
+                    LogSuccess("Резервная копия создана: " + backupPath);
+                }
+
+                File.WriteAllText(indexJsPath, patchContent);
+                LogSuccess("index.js пропатчен: " + indexJsPath);
+            }
+            catch (Exception ex)
+            {
+                LogError("Repair failed: " + ex.Message);
+            }
         }
 
         static string? GetLatestDiscordExePath()
@@ -103,7 +216,88 @@ namespace BetterDiscordLauncher
             catch { return "unknown"; }
         }
 
-        static async Task<bool> UpdateBetterDiscordAsar()
+        static void KillDiscord()
+        {
+            foreach (var proc in Process.GetProcessesByName("Discord"))
+            {
+                try { proc.Kill(); proc.WaitForExit(); } catch { }
+            }
+        }
+
+        static string? GetDiscordIndexJsPath()
+        {
+            try
+            {
+                if (!Directory.Exists(discordBasePath)) return null;
+                var appDirs = Directory.GetDirectories(discordBasePath, "app-*");
+                var latestApp = appDirs.OrderBy(d => d).LastOrDefault();
+                if (latestApp == null) return null;
+
+                var modulesPath = Path.Combine(latestApp, "modules");
+                if (!Directory.Exists(modulesPath)) return null;
+
+                var coreCandidates = Directory.GetDirectories(modulesPath, "discord_desktop_core*");
+                foreach (var coreCandidate in coreCandidates.OrderByDescending(d => d))
+                {
+                    var innerCorePath = Path.Combine(coreCandidate, "discord_desktop_core");
+                    if (Directory.Exists(innerCorePath))
+                        return Path.Combine(innerCorePath, "index.js");
+
+                    return Path.Combine(coreCandidate, "index.js");
+                }
+
+                return null;
+            }
+            catch (Exception ex)
+            {
+                LogError("Ошибка поиска index.js: " + ex.Message);
+                return null;
+            }
+        }
+
+        static bool IsIndexJsPatched()
+        {
+            var indexJsPath = GetDiscordIndexJsPath();
+            if (indexJsPath == null || !File.Exists(indexJsPath))
+            {
+                LogError("index.js не найден для проверки патча.");
+                return false;
+            }
+
+            string content = File.ReadAllText(indexJsPath);
+            bool contains = content.Contains("betterdiscord.asar");
+            LogStep(contains ? "[Check] Патч в index.js найден." : "[Check] Патч в index.js не найден.");
+            return contains;
+        }
+
+        static void RestoreIndexJsBackup()
+        {
+            try
+            {
+                string backupPath = Path.Combine(launcherBasePath, "index.js.bak");
+                if (!File.Exists(backupPath))
+                {
+                    LogError("Файл index.js.bak не найден, восстановление невозможно.");
+                    return;
+                }
+
+                var indexJsPath = GetDiscordIndexJsPath();
+                if (indexJsPath == null)
+                {
+                    LogError("index.js не найден для восстановления.");
+                    return;
+                }
+
+                File.Copy(backupPath, indexJsPath, true);
+                LogSuccess("index.js восстановлен из .bak");
+            }
+            catch (Exception ex)
+            {
+                LogError("Ошибка при восстановлении index.js: " + ex.Message);
+            }
+        }
+
+        static async Task UpdateBetterDiscordAsar()
         {
             try
             {
@@ -112,86 +306,32 @@ namespace BetterDiscordLauncher
                 client.DefaultRequestHeaders.UserAgent.ParseAdd("BetterDiscordLauncher");
                 var json = await client.GetStringAsync(api);
                 using var doc = JsonDocument.Parse(json);
-                var asset = doc.RootElement.GetProperty("assets")
-                    .EnumerateArray()
+                var asset = doc.RootElement.GetProperty("assets").EnumerateArray()
                     .FirstOrDefault(a => a.GetProperty("name").GetString()?.EndsWith(".asar") == true);
-                if (asset.ValueKind == JsonValueKind.Undefined) return false;
-                var url = asset.GetProperty("browser_download_url").GetString()!;
+                var url = asset.GetProperty("browser_download_url").GetString();
+                var data = await client.GetByteArrayAsync(url);
                 Directory.CreateDirectory(bdDataPath);
-                var data = await client.GetByteArrayAsync(url);
                 await File.WriteAllBytesAsync(asarFilePath, data);
-                return true;
             }
             catch (Exception ex)
             {
-                LogError($"Ошибка UpdateBetterDiscordAsar: {ex.Message}");
-                return false;
+                LogError("Ошибка обновления asar: " + ex.Message);
             }
         }
 
-        static async Task DownloadAndLaunchInstaller(string discordExePath)
+        static void LaunchDiscord(string path)
         {
             try
             {
-                const string url = "https://github.com/BetterDiscord/Installer/releases/latest/download/BetterDiscord-Windows.exe";
-                string installerPath = Path.Combine(launcherBasePath, "BetterDiscordInstaller.exe");
-
-                LogStep("Начинаем скачивание установщика BetterDiscord...");
-                using var client = new HttpClient();
-                client.DefaultRequestHeaders.UserAgent.ParseAdd("BetterDiscordLauncher");
-
-                var data = await client.GetByteArrayAsync(url);
-                await File.WriteAllBytesAsync(installerPath, data);
-                LogSuccess("Скачан установщик BetterDiscord.");
-
-                LogStep("Пробуем запустить установщик...");
-                var process = Process.Start(new ProcessStartInfo(installerPath)
+                Process.Start(new ProcessStartInfo(path)
                 {
                     UseShellExecute = true,
-                    WorkingDirectory = launcherBasePath
-                });
-
-                if (process == null)
-                {
-                    LogError("Не удалось запустить установщик BetterDiscord.");
-                    return;
-                }
-                LogSuccess("Установщик BetterDiscord запущен.");
-
-                await Task.Run(() => process.WaitForExit());
-
-                LogStep("Установщик завершён. Проверяем папку BetterDiscord...");
-
-                if (Directory.Exists(bdInstallPathAppData))
-                {
-                    LogSuccess("Папка BetterDiscord найдена. Запускаем Discord...");
-                    LaunchDiscord(discordExePath);
-                    LogSuccess("Discord запущен.");
-                }
-                else
-                {
-                    LogError("Папка BetterDiscord не найдена после установки.");
-                }
-            }
-            catch (Exception ex)
-            {
-                LogError($"Ошибка при скачивании или запуске установщика: {ex.Message}");
-            }
-        }
-
-        static void LaunchDiscord(string exePath)
-        {
-            try
-            {
-                Process.Start(new ProcessStartInfo(exePath)
-                {
-                    UseShellExecute = true,
-                    WorkingDirectory = Path.GetDirectoryName(exePath)
+                    WorkingDirectory = Path.GetDirectoryName(path)
                 });
             }
             catch (Exception ex)
             {
-                LogError($"Ошибка запуска Discord: {ex.Message}");
+                LogError("Ошибка запуска Discord: " + ex.Message);
             }
         }
 
@@ -204,11 +344,5 @@ namespace BetterDiscordLauncher
         static void LogStep(string m) => Log("[*]", m);
         static void LogSuccess(string m) => Log("[+]", m);
         static void LogError(string m) => Log("[-]", m);
-
-        static void WaitForExit()
-        {
-            Console.WriteLine("Нажмите любую клавишу для выхода...");
-            Console.ReadKey();
-        }
     }
 }
